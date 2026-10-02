@@ -272,3 +272,29 @@ tr.cmp-hot td { color: var(--amber-soft); }
 .room-protection.is-safe { color: var(--ok); border-color: var(--ok); background: rgba(76, 208, 125, 0.08); }
 .room-protection.is-warn { color: var(--danger); border-color: var(--danger); background: rgba(255, 107, 107, 0.10); }
 .room-protection.is-tripped { color: var(--amber-soft); border-color: var(--amber); background: rgba(245, 185, 66, 0.12); }
+
+/* 房间内的主持权交接状态条：只展示交接状态，凭证明文仅持密钥者刚发起时可见 */
+.room-handover {
+  margin: .5rem 0;
+  padding: .55rem .8rem;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  font-size: .84rem;
+  line-height: 1.5;
+}
+.room-handover.is-idle { color: var(--muted); border-color: var(--line); background: rgba(154, 148, 179, 0.06); }
+.room-handover.is-pending { color: var(--amber-soft); border-color: var(--amber); background: rgba(245, 185, 66, 0.12); }
+.room-handover .rh-title { font-weight: 600; margin-right: .4rem; }
+.room-handover .rh-actions { display: flex; gap: .5rem; align-items: center; margin-top: .45rem; flex-wrap: wrap; }
+.room-handover .rh-token-row { display: flex; gap: .5rem; align-items: center; margin: .4rem 0; flex-wrap: wrap; }
+.room-handover .rh-token {
+  font-size: .9rem;
+  letter-spacing: .04em;
+  padding: .25rem .5rem;
+  border-radius: 6px;
+  border: 1px solid var(--amber);
+  color: var(--amber-soft);
+  background: rgba(0, 0, 0, 0.25);
+  user-select: all;
+}
+.room-handover .rh-meta { color: var(--muted); font-size: .78rem; }

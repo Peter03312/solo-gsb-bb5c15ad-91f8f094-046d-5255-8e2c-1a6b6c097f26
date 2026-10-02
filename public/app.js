@@ -594,7 +594,7 @@ function saveRoomKey(code, key) {
   localStorage.setItem(ROOM_KEY_STORE, JSON.stringify(store));
 }
 
-state.room = null; // { view, session, key, anchor:{wall,time,speed,playing}, pollTimer, rafId }
+state.room = null; // { view, session, key, issuedToken:{token,expires_at}, anchor:{wall,time,speed,playing}, pollTimer, rafId }
 
 function renderRoomVersionOptions() {
   const sel = $('room-create-version');
@@ -664,6 +664,9 @@ async function enterRoom(code, key, initialView) {
   state.room = {
     view,
     key: key || loadRoomKeyStore()[view.code] || null,
+    // 本浏览器本次发起交接后拿到的一次性凭证（仅内存保留，刷新即忘；不写入 localStorage）
+    issuedToken: null,
+    handoverSig: null,
     session: {
       id: snap.id,
       label: snap.label,
@@ -688,6 +691,7 @@ async function enterRoom(code, key, initialView) {
   renderRoomRole();
   renderRoom();
   renderRoomProtection();
+  renderRoomHandover();
 
   document.querySelector('.tab[data-tab="room"]').click();
 }
@@ -745,6 +749,7 @@ async function pollRoom() {
     $('room-speed').value = String(view.speed);
     renderRoomRole();
     renderRoomProtection();
+    renderRoomHandover();
   } catch {
     /* 单次轮询失败不打断观看：下一周期重试 */
   }
@@ -786,14 +791,24 @@ async function roomControl(action, extra = {}) {
       ...extra,
     });
     r.view = view;
+    // 主持人成功控制房间后，服务端已作废旧凭证：清掉本地那份一次性凭证
+    r.issuedToken = null;
+    r.handoverSig = null;
     applyRoomAnchor(view);
     $('room-speed').value = String(view.speed);
     renderRoomRole();
     renderRoomProtection();
-    renderRoomProtection();
+    renderRoomHandover();
   } catch (err2) {
     if (err2.status === 409) {
       await pollRoom(); // 过期：按服务端最新状态校时后提示重试
+    } else if (err2.status === 403) {
+      // 密钥已失效（典型：主持权已被接班人领走，旧密钥即刻作废）：退回观看者身份
+      r.key = null;
+      saveRoomKey(r.view.code, null);
+      $('room-key-input').value = '';
+      renderRoomRole();
+      renderRoomHandover();
     } else {
       $('room-speed').value = String(r.view.speed); // 被拒绝（如非法速度）：回滚本地选择
     }
@@ -832,6 +847,10 @@ function leaveRoom() {
   $('room-lobby').hidden = false;
   $('room-join-code').value = '';
   $('room-join-key').value = '';
+  const ho = $('room-handover');
+  ho.hidden = true;
+  ho.textContent = '';
+  ho.className = 'room-handover';
   if (readHash()[HASH_ROOM]) history.replaceState(null, '', window.location.pathname);
   document.querySelector('.tab[data-tab="player"]').click();
 }
@@ -843,6 +862,8 @@ function renderRoom() {
   $('room-time-current').textContent = fmt(t);
   $('room-timeline').value = String(t);
   $('room-revision-view').textContent = String(r.view.revision);
+  // 交接凭证倒计时每秒重绘（pending 状态变化时顺带重绑按钮）
+  if (r.issuedToken || (r.view.handover && r.view.handover.pending)) renderRoomHandover();
   renderStageInto(r.session, t, $('room-stage'), $('room-levels'), $('room-cue-timeline'));
 }
 
@@ -887,6 +908,181 @@ function renderRoomProtection() {
   }
   box.className = `room-protection ${cls}`;
   box.innerHTML = html;
+}
+
+/* --------------------------- 主持权交接 --------------------------- */
+// 主持人凭当前密钥与修订号发起交接，取得只显示一次、五分钟有效的凭证；接班人凭房间码与
+// 凭证领取新密钥。页面只显示交接“状态”：凭证/密钥明文只出现在发起（给主持人）与领取
+// （给接班人）的当次响应里，不进 localStorage、不向其他观看者展示。
+
+function fmtCountdown(sec) {
+  const s = Math.max(0, Math.ceil(sec));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}:${String(r).padStart(2, '0')}`;
+}
+
+// 渲染交接区。结构只在状态变化时重建（避免每秒重建打断凭证输入框焦点）；倒计时文本
+// 由 renderRoom 每帧更新 #room-handover-countdown。凭证明文只在本浏览器刚发起时展示
+function renderRoomHandover() {
+  const r = state.room;
+  if (!r) return;
+  const box = $('room-handover');
+  const h = r.view.handover || { pending: false };
+  const now = Date.now() / 1000;
+  const isHost = !!r.key;
+
+  // 本浏览器刚发起、且服务端仍有同一待领取凭证：展示凭证明文（仅此一次、仅此页面）
+  const issued =
+    r.issuedToken && h.pending && h.expires_at === r.issuedToken.expires_at ? r.issuedToken : null;
+  if (r.issuedToken && !issued) r.issuedToken = null; // 服务端凭证已不在（领取/作废/过期），清理本地副本
+  const issuedExpired = issued && issued.expires_at - now <= 0;
+  if (issuedExpired) r.issuedToken = null;
+
+  // 结构签名：只有模式/剩余有效期跨过 0 变化时才重建 DOM（倒计时文本走 tick，不重建）
+  const mode = issuedExpired
+    ? 'pending'
+    : issued
+      ? 'issued'
+      : h.pending
+        ? isHost
+          ? 'pending-host'
+          : 'pending-viewer'
+        : isHost
+          ? 'idle-host'
+          : 'idle-viewer';
+  const sig = `${mode}:${h.pending ? h.expires_at : ''}:${h.revision || ''}`;
+  if (r.handoverSig === sig) {
+    tickRoomHandover(box);
+    return;
+  }
+  r.handoverSig = sig;
+
+  box.hidden = false;
+
+  if (issued) {
+    box.className = 'room-handover is-pending';
+    box.innerHTML =
+      '<span class="rh-title">🔑 交接凭证已生成（仅显示这一次）</span>' +
+      `把房间码 <b>${esc(r.view.code)}</b> 与下方凭证发给接班人，五分钟内领取：` +
+      `<div class="rh-token-row"><code class="rh-token">${esc(issued.token)}</code>` +
+      `<button id="btn-room-copy-token" type="button">复制凭证</button></div>` +
+      `<div class="rh-meta">剩余有效期 <b id="room-handover-countdown"></b> · 基于修订号 ${h.revision}。` +
+      '接班人领取成功后你的密钥立即失效；你若在此期间执行播放/暂停/跳转/变速，本凭证立即作废。</div>';
+    $('btn-room-copy-token').addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(issued.token);
+      } catch {
+        /* 剪贴板不可用时凭证仍可手选 */
+      }
+    });
+  } else if (h.pending) {
+    box.className = 'room-handover is-pending';
+    if (isHost) {
+      box.innerHTML =
+        '<span class="rh-title">主持权交接进行中</span>' +
+        '房间存在一份待领取凭证（剩余 <b id="room-handover-countdown"></b>，' +
+        `基于修订号 ${h.revision}）。再次发起可作废旧凭证并生成新凭证；` +
+        '你一旦执行播放/暂停/跳转/变速，凭证立即作废。' +
+        '<div class="rh-actions"><button id="btn-room-handover-issue" class="primary" type="button">发起交接（作废旧凭证）</button></div>';
+      $('btn-room-handover-issue').addEventListener('click', issueRoomHandover);
+    } else {
+      box.innerHTML =
+        '<span class="rh-title">主持权交接进行中</span>' +
+        '主持人已生成交接凭证（剩余 <b id="room-handover-countdown"></b>）。' +
+        '若你是接班人，粘贴一次性凭证领取新控制密钥（领取成功后房间由你控制）：' +
+        '<div class="rh-actions">' +
+        '<input type="text" id="room-claim-token" placeholder="交接凭证（48 位十六进制）" style="flex:1;min-width:16rem" />' +
+        '<button id="btn-room-handover-claim" class="primary" type="button">领取新控制密钥</button></div>';
+      $('btn-room-handover-claim').addEventListener('click', claimRoomHandover);
+    }
+  } else if (isHost) {
+    box.className = 'room-handover is-idle';
+    box.innerHTML =
+      '<span class="rh-title">主持权交接</span>你是当前主持人。可凭当前修订号发起交接，' +
+      '生成仅显示一次、五分钟有效的交接凭证交给接班人。' +
+      '<div class="rh-actions"><button id="btn-room-handover-issue" class="primary" type="button">发起主持权交接</button></div>';
+    $('btn-room-handover-issue').addEventListener('click', issueRoomHandover);
+  } else {
+    box.className = 'room-handover is-idle';
+    box.innerHTML =
+      '<span class="rh-title">主持权交接</span>观看者只读。若你是接班人，请在主持人生成凭证后，' +
+      '粘贴一次性凭证领取新控制密钥：' +
+      '<div class="rh-actions">' +
+      '<input type="text" id="room-claim-token" placeholder="交接凭证（48 位十六进制）" style="flex:1;min-width:16rem" />' +
+      '<button id="btn-room-handover-claim" type="button">领取新控制密钥</button></div>';
+    $('btn-room-handover-claim').addEventListener('click', claimRoomHandover);
+  }
+  tickRoomHandover(box);
+}
+
+// 仅刷新倒计时文本（不重建 DOM）；到期触发一次结构重绘以切换为“已过期/无凭证”形态
+function tickRoomHandover(box) {
+  const r = state.room;
+  if (!r) return;
+  const el = box.querySelector('#room-handover-countdown');
+  if (!el) return;
+  const expiresAt = r.issuedToken
+    ? r.issuedToken.expires_at
+    : r.view.handover && r.view.handover.pending
+      ? r.view.handover.expires_at
+      : null;
+  if (expiresAt == null) return;
+  const left = expiresAt - Date.now() / 1000;
+  if (left <= 0) {
+    r.handoverSig = null;
+    renderRoomHandover();
+    return;
+  }
+  el.textContent = fmtCountdown(left);
+}
+
+async function issueRoomHandover() {
+  const r = state.room;
+  if (!r || !r.key) return;
+  clearErr($('room-error'));
+  try {
+    const d = await api('POST', `/api/rooms/${encodeURIComponent(r.view.code)}/handover/issue`, {
+      control_key: r.key,
+      revision: r.view.revision,
+    });
+    r.view = d;
+    r.issuedToken = { token: d.handover_token, expires_at: d.handover_token_expires_at };
+    r.handoverSig = null;
+    applyRoomAnchor(d);
+    renderRoomHandover();
+  } catch (err2) {
+    if (err2.status === 409) await pollRoom();
+    showErr($('room-error'), `发起交接失败：${err2.message}`);
+  }
+}
+
+async function claimRoomHandover() {
+  const r = state.room;
+  if (!r) return;
+  const token = $('room-claim-token').value.trim();
+  if (!token) return showErr($('room-error'), '请填写主持人提供的一次性交接凭证。');
+  clearErr($('room-error'));
+  try {
+    const d = await api('POST', `/api/rooms/${encodeURIComponent(r.view.code)}/handover/claim`, {
+      handover_token: token,
+    });
+    // 领取成功：新控制密钥仅本次返回；保存后即成为持密钥者。播放/速度/版本/保护状态原样保留
+    r.view = d;
+    r.key = d.control_key;
+    r.issuedToken = null;
+    r.handoverSig = null;
+    saveRoomKey(d.code, d.control_key);
+    $('room-key-input').value = d.control_key;
+    applyRoomAnchor(d);
+    $('room-speed').value = String(d.speed);
+    renderRoomRole();
+    renderRoomProtection();
+    renderRoomHandover();
+  } catch (err2) {
+    if (err2.status === 409 || err2.status === 404 || err2.status === 400) await pollRoom();
+    showErr($('room-error'), `领取失败：${err2.message}`);
+  }
 }
 
 /* ----------------------------- 版本比对 ----------------------------- */
