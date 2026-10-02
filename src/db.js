@@ -142,6 +142,21 @@ CREATE TABLE IF NOT EXISTS rooms (
   tripped_time       REAL,
   created_at  REAL NOT NULL
 );
+
+-- 主持权交接凭证：当前持密钥者凭当前控制密钥与房间修订号发起，取得仅显示一次、
+-- 五分钟有效的一次性交接凭证。同一房间同时只保留一份待领取凭证（以 room_id 为
+-- 主键，再次发起 UPSERT 即覆盖旧凭证——旧凭证随即失效）。接班人凭房间码与凭证
+-- 领取新的控制密钥：领取与房间修订号 +1 在同一事务内原子完成，旧密钥即刻失效。
+-- 凭证发出后若原主持人成功控制房间（修订号前进），凭证的 revision 即过期，
+-- 接班人领取时按“过期修订号”409 拒绝且控制权不变；凭证到达 expires_at 后同样
+-- 拒绝（房间 GET 只报告 active 状态，不回显凭证本身或任何控制密钥）。
+CREATE TABLE IF NOT EXISTS room_handovers (
+  room_id    INTEGER PRIMARY KEY REFERENCES rooms(id) ON DELETE CASCADE,
+  token      TEXT NOT NULL,                  -- 一次性交接凭证（仅发起响应中完整返回一次）
+  revision   INTEGER NOT NULL,               -- 发起时房间修订号：领取时必须仍与房间修订号一致
+  expires_at REAL NOT NULL,                  -- 墙钟秒：Date.now()/1000 + 300（五分钟有效）
+  created_at REAL NOT NULL
+);
 `;
 
 let db;

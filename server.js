@@ -1394,6 +1394,15 @@ const ROOM_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 去除 0/O/1/I
 const ROOM_SPEEDS = [0.5, 1, 2];
 // 与引擎一致的端点浮点容差（超载区间端点已按 1e-9 归整）
 const ROOM_EPS = 1e-7;
+// 主持权交接凭证有效期：五分钟（凭证仅在发起响应中完整显示一次）
+const HANDOVER_TTL_SECONDS = 300;
+
+// 等长常量时间比较，避免密钥/凭证比较的计时侧信道；长度不同直接失败
+function secretEqual(provided, expected) {
+  const a = Buffer.from(String(provided));
+  const b = Buffer.from(String(expected));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
 
 function genRoomCode() {
   for (;;) {
@@ -1614,9 +1623,37 @@ function buildProtection(row, state, guard) {
   return block;
 }
 
-// 房间对外视图（创建/查询/控制共用）；state 由 computeRoomState 得到
+// 房间当前待领取交接凭证的对外状态块（所有房间状态响应一致，观看者也可见）。
+// 仅报告交接进行与否与到期信息；绝不回显凭证本体或任何控制密钥。
+//  - 凭证不存在：不输出 handover 字段；
+//  - 已过期 / 已被原主持人后续控制作废（绑定修订号落后于房间修订号）：active=false；
+//  - 待领取：active=true，附到期墙钟、剩余秒数与发起时修订号。
+function buildHandoverBlock(row, state, now) {
+  const ho = db.prepare('SELECT * FROM room_handovers WHERE room_id = ?').get(row.id);
+  if (!ho) return undefined;
+  const block = {
+    active: false,
+    revision: ho.revision,
+    issued_at: round6(ho.created_at),
+    expires_at: round6(ho.expires_at),
+  };
+  const active = ho.expires_at > now && ho.revision === state.revision;
+  if (active) {
+    block.active = true;
+    block.seconds_remaining = round6(Math.max(0, ho.expires_at - now));
+  } else if (ho.revision !== state.revision) {
+    block.reason = 'superseded';
+    block.reason_text = '原主持人在凭证发出后又控制了房间，本交接凭证已作废，请让主持人重新发起交接';
+  } else {
+    block.reason = 'expired';
+    block.reason_text = '交接凭证已过期（有效期五分钟），请让主持人重新发起交接';
+  }
+  return block;
+}
+
+// 房间对外视图（创建/查询/控制/交接共用）；state 由 computeRoomState 得到
 function buildRoomView(row, state, now, guard) {
-  return {
+  const view = {
     code: row.code,
     label: row.label,
     version: { id: row.version_id, label: row.version_label },
@@ -1630,6 +1667,10 @@ function buildRoomView(row, state, now, guard) {
     server_wall: now,
     server_time: round6(state.time),
   };
+  // 当前交接状态（不含凭证、不含密钥）；无待领取凭证时不输出该字段
+  const handover = buildHandoverBlock(row, state, now);
+  if (handover) view.handover = handover;
+  return view;
 }
 
 // 创建共享房间：基于已发布版本，固定版本快照，初始暂停在 0 秒
@@ -1708,9 +1749,7 @@ app.post('/api/rooms/:code/control', (req, res) => {
   if (key === undefined || key === null || key === '') {
     return err(res, 403, '缺少控制密钥：仅房间创建者（持密钥者）可以控制播放，请在页面填写密钥');
   }
-  const keyBuf = Buffer.from(String(key));
-  const expectedBuf = Buffer.from(row.control_key);
-  if (keyBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(keyBuf, expectedBuf)) {
+  if (!secretEqual(key, row.control_key)) {
     return err(res, 403, '控制密钥无效：无权控制该房间（观看者只能同步观看）');
   }
 
@@ -1844,6 +1883,9 @@ app.post('/api/rooms/:code/control', (req, res) => {
            tripped_circuit_id = ?, tripped_time = ?
        WHERE id = ?`
     ).run(playing ? 1 : 0, time, anchor, nextSpeed, tripCircuit, tripTime, cur.id);
+    // 原主持人成功控制房间（修订号前进）：已发出的交接凭证即刻失效——不删行，
+    // 保留为 active:false / reason:"superseded" 供等待的接班人看到明确的作废原因；
+    // 接班人再领取会按过期修订号 409 被拒且控制权不变（需让主持人重新发起）。
     return db.prepare(`${roomSelect} WHERE r.id = ?`).get(cur.id);
   });
 
@@ -1879,6 +1921,185 @@ app.post('/api/rooms/:code/control', (req, res) => {
 
   const state = computeRoomState(updated, { now, guard });
   res.json(buildRoomView(updated, state, now, guard));
+});
+
+/* ----------------------- 主持权交接（一次性五分钟凭证） ----------------------- */
+// 当前主持人凭当前控制密钥与房间修订号发起交接，取得仅显示一次、五分钟有效的
+// 交接凭证；同一房间同时只保留一份待领取凭证，再次发起覆盖旧凭证（旧凭证失效）。
+// 接班人凭房间码与凭证领取新的控制密钥：领取与房间修订号 +1 原子完成，旧密钥
+// 即刻失效；并发领取至多一人成功。凭证发出后原主持人一旦成功控制房间，凭证即
+// 作废（修订号不再匹配），接班人须重新索取。播放/暂停状态、时码、速度、固定
+// 版本与超载保护状态均不因交接而重置。
+
+// 解析并校验房间码：返回 { code } 或 { status, message }（与既有房间接口同一口径）
+function resolveRoomCode(req) {
+  const code = normalizeRoomCode(req.params.code);
+  if (code.length !== ROOM_CODE_LEN) {
+    return { status: 400, message: `房间码无效：${JSON.stringify(req.params.code)}（须为 ${ROOM_CODE_LEN} 位房间码）` };
+  }
+  const row = getRoomRowByCode(code);
+  if (!row) return { status: 404, message: `房间不存在：房间码 ${code}（请核对后重试）` };
+  return { code, row };
+}
+
+// POST /api/rooms/:code/handover/issue  主持人发起交接：{control_key, revision}
+app.post('/api/rooms/:code/handover/issue', (req, res) => {
+  const found = resolveRoomCode(req);
+  if (found.message) return err(res, found.status, found.message);
+  const { row } = found;
+
+  // 必须携带当前控制密钥（错误/缺失 → 403，与控制接口同一口径，不回显房间密钥）
+  const key = req.body?.control_key;
+  if (key === undefined || key === null || key === '') {
+    return err(res, 403, '缺少控制密钥：仅当前主持人（持密钥者）可以发起主持权交接');
+  }
+  if (!secretEqual(key, row.control_key)) {
+    return err(res, 403, '控制密钥无效：无权发起该房间的主持权交接');
+  }
+
+  // 修订号：必须携带、为非负整数且与房间当前一致（过期修订号 → 409，凭证不变）
+  if (req.body === null || typeof req.body !== 'object' || !('revision' in req.body)) {
+    return err(res, 400, '发起交接必须携带房间修订号 revision（与服务器当前修订号一致才允许交接）');
+  }
+  const clientRev = toNum(req.body.revision);
+  if (!Number.isInteger(clientRev) || clientRev < 0) {
+    return err(res, 400, `修订号无效：${JSON.stringify(req.body.revision)}（须为非负整数）`);
+  }
+  if (clientRev !== row.revision) {
+    return err(
+      res,
+      409,
+      `修订号冲突：提交基于修订号 ${clientRev}，房间当前已为修订号 ${row.revision}；请按服务端最新状态校时后重新发起交接（本次未改动房间）`
+    );
+  }
+
+  const now = Date.now() / 1000;
+  const token = crypto.randomBytes(24).toString('hex');
+  // 同一房间只保留一份待领取凭证：UPSERT 覆盖旧凭证，旧凭证随之失效
+  db.prepare(
+    `INSERT INTO room_handovers (room_id, token, revision, expires_at, created_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT (room_id) DO UPDATE SET
+       token = excluded.token, revision = excluded.revision,
+       expires_at = excluded.expires_at, created_at = excluded.created_at`
+  ).run(row.id, token, row.revision, now + HANDOVER_TTL_SECONDS, now);
+  // 顺手清理其他房间已过期的交接凭证（用严格小于，绝不波及刚 UPSERT 的本行）
+  db.prepare('DELETE FROM room_handovers WHERE room_id IS NOT ? AND expires_at <= ?').run(row.id, now);
+
+  const guard = row.overload_protection ? loadRoomGuard(row.version_id) : null;
+  const state = computeRoomState(row, { now, guard });
+  res.json({
+    ...buildRoomView(row, state, now, guard),
+    // 交接凭证仅在本次发起响应中完整返回一次；之后任何接口（含 GET 房间）都不再回显
+    handover_token: token,
+    handover_expires_in: HANDOVER_TTL_SECONDS,
+  });
+});
+
+// POST /api/rooms/:code/handover/claim  接班人领取：{handover_token, revision}
+// 领取成功与房间修订号 +1 在同一事务内原子完成；旧密钥即刻失效、凭证一次性删除。
+app.post('/api/rooms/:code/handover/claim', (req, res) => {
+  const found = resolveRoomCode(req);
+  if (found.message) return err(res, found.status, found.message);
+  const { row } = found;
+
+  // 接班人不持控制密钥：仅凭房间码与交接凭证领取
+  const token = req.body?.handover_token;
+  if (token === undefined || token === null || token === '') {
+    return err(res, 403, '缺少交接凭证：请向当前主持人索取一次性交接凭证（handover_token）');
+  }
+  if (typeof token !== 'string') {
+    return err(res, 403, '交接凭证无效：请使用主持人发起交接时取得的一次性凭证');
+  }
+
+  // 修订号：必须携带、为非负整数（客户端看到的房间修订号，须与凭证绑定的修订号一致）
+  if (req.body === null || typeof req.body !== 'object' || !('revision' in req.body)) {
+    return err(res, 400, '领取交接凭证必须携带房间修订号 revision（以加入房间时看到的当前修订号为准）');
+  }
+  const clientRev = toNum(req.body.revision);
+  if (!Number.isInteger(clientRev) || clientRev < 0) {
+    return err(res, 400, `修订号无效：${JSON.stringify(req.body.revision)}（须为非负整数）`);
+  }
+
+  const now = Date.now() / 1000;
+  const claim = db.transaction(() => {
+    const cur = db.prepare(`${roomSelect} WHERE r.id = ?`).get(row.id);
+    const ho = db.prepare('SELECT * FROM room_handovers WHERE room_id = ?').get(cur.id);
+
+    // 凭证不存在（从未发起、已被领取删除、或被再次发起覆盖后又领取）：明确拒绝
+    if (!ho || !secretEqual(token, ho.token)) {
+      const e = new Error('HANDOVER_BAD_TOKEN');
+      e.code = 'HANDOVER_BAD_TOKEN';
+      throw e;
+    }
+    // 凭证已过期：抛出后由事务外删除（事务内抛出会整体回滚）
+    if (ho.expires_at <= now) {
+      const e = new Error('HANDOVER_EXPIRED');
+      e.code = 'HANDOVER_EXPIRED';
+      throw e;
+    }
+    // 凭证发出后原主持人成功控制过房间：绑定修订号不再匹配 → 凭证作废，
+    // 抛出后由事务外删除（接班人须重新索取），控制权不变。
+    // 先于客户端修订号检查：即使客户端携带的修订号也过期，也明确告知“凭证已作废”。
+    if (ho.revision !== cur.revision) {
+      const e = new Error('HANDOVER_REVOKED');
+      e.code = 'HANDOVER_REVOKED';
+      e.current = cur.revision;
+      e.bound = ho.revision;
+      throw e;
+    }
+    // 过期修订号（客户端看到的修订号落后）：不改变控制权、不删凭证（同修订号可刷新后重试）
+    if (clientRev !== cur.revision) {
+      const e = new Error(`ROOM_CONFLICT:${cur.revision}`);
+      e.code = 'ROOM_CONFLICT';
+      e.current = cur.revision;
+      throw e;
+    }
+
+    // 原子领取：换发新控制密钥、修订号 +1、删除一次性凭证。
+    // 播放状态/时码/速度/固定版本/超载保护触发信息一律不动。
+    const newKey = crypto.randomBytes(24).toString('hex');
+    db.prepare('UPDATE rooms SET control_key = ?, revision = revision + 1 WHERE id = ?').run(newKey, cur.id);
+    db.prepare('DELETE FROM room_handovers WHERE room_id = ?').run(cur.id);
+    return { newKey, updated: db.prepare(`${roomSelect} WHERE r.id = ?`).get(cur.id) };
+  });
+
+  let result;
+  try {
+    result = claim();
+  } catch (e) {
+    if (e.code === 'HANDOVER_BAD_TOKEN') {
+      return err(res, 403, '交接凭证无效：凭证不存在、输入有误或已被使用（同一房间只认最新一份待领取凭证，请重新向主持人索取；本次未改变控制权）');
+    }
+    if (e.code === 'HANDOVER_EXPIRED') {
+      db.prepare('DELETE FROM room_handovers WHERE room_id = ?').run(row.id);
+      return err(res, 403, '交接凭证已过期（有效期五分钟）：请让当前主持人重新发起交接（本次未改变控制权）');
+    }
+    if (e.code === 'HANDOVER_REVOKED') {
+      db.prepare('DELETE FROM room_handovers WHERE room_id = ?').run(row.id);
+      return err(
+        res,
+        409,
+        `交接凭证已作废：发起时房间为修订号 ${e.bound}，原主持人之后又成功控制了房间（当前修订号 ${e.current}）；请让主持人重新发起交接（本次未改变控制权）`
+      );
+    }
+    if (e.code === 'ROOM_CONFLICT') {
+      return err(
+        res,
+        409,
+        `修订号冲突：领取基于修订号 ${clientRev}，房间当前已为修订号 ${e.current}；请重新查看房间状态后用最新修订号领取（凭证仍然有效，本次未改变控制权）`
+      );
+    }
+    throw e;
+  }
+
+  const guard = result.updated.overload_protection ? loadRoomGuard(result.updated.version_id) : null;
+  const state = computeRoomState(result.updated, { now, guard });
+  res.json({
+    ...buildRoomView(result.updated, state, now, guard),
+    // 新控制密钥仅在本次领取响应中完整返回一次；重试/任何其他接口都不再回显
+    control_key: result.newKey,
+  });
 });
 
 /* ------------------------------- 错误处理 ------------------------------ */
